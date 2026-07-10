@@ -14,8 +14,13 @@
  * limitations under the License.
  */
 
-#include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
+#if defined(_MSC_VER)
+#undef __in
+#undef __out
+#undef __inout
+#endif
+#include <ATen/cuda/CUDAContext.h>
 
 #include "../dispatch_utils.h"
 #include "../utils.cuh"

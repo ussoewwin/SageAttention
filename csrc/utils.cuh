@@ -17,6 +17,13 @@
 #pragma once
 #include <torch/extension.h>
 
+// MSVC SAL macros collide with CUDA 13.2 CCCL tcgen05 asm operands (__out).
+#if defined(_MSC_VER)
+#undef __in
+#undef __out
+#undef __inout
+#endif
+
 #define CHECK_CUDA(x) \
   TORCH_CHECK(x.is_cuda(), "Tensor " #x " must be on CUDA")
 #define CHECK_DTYPE(x, true_dtype)     \

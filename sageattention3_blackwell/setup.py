@@ -121,7 +121,7 @@ if not SKIP_CUDA_BUILD:
     nvcc_flags = [
         "-O3",
         # "-O0",
-        "-std=c++17",
+        "-std=c++20",
         "-U__CUDA_NO_HALF_OPERATORS__",
         "-U__CUDA_NO_HALF_CONVERSIONS__",
         "-U__CUDA_NO_BFLOAT16_OPERATORS__",
@@ -150,11 +150,12 @@ if not SKIP_CUDA_BUILD:
 
     if os.name == "nt":
         nvcc_flags += ["-D_WIN32=1", "-DUSE_CUDA=1"]
-        cxx_flags = ["/std:c++17", "/Zc:__cplusplus", "/bigobj", "/MD", "/permissive-"]
+        # Torch 2.13+ headers need C++20; /Zc:preprocessor already required for CUDA 13.2 CCCL.
+        cxx_flags = ["/std:c++20", "/Zc:__cplusplus", "/Zc:preprocessor", "/bigobj", "/MD", "/permissive-"]
         nvcc_flags += [f"-Xcompiler={flag}" for flag in cxx_flags]
         cxx_flags += ["/O2"]
     else:
-        cxx_flags = ["-O3", "-std=c++17"]        
+        cxx_flags = ["-O3", "-std=c++20"]        
 
     ext_modules.append(
         CUDAExtension(
@@ -195,7 +196,7 @@ class CachedWheelsCommand(_bdist_wheel):
 
 setup(
     name=PACKAGE_NAME,
-    version="1.0.0",
+    version="1.0.0" + (f"+cu{torch.version.cuda.replace('.', '')}torch{torch.__version__.split('+')[0]}" if not SKIP_CUDA_BUILD else ""),
     packages=find_packages(
         exclude=(
             "build",

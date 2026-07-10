@@ -48,11 +48,14 @@ if not SKIP_CUDA_BUILD:
     SUPPORTED_ARCHS = {"8.0", "8.6", "8.9", "9.0", "10.0", "12.0", "12.1"}
 
     # Compiler flags.
+    # Torch 2.13+ requires C++20 (designated initializers / bit-field defaults).
+    # CUDA 13.2 CCCL + MSVC: /Zc:preprocessor; SAL __out is #undef'd in csrc
+    # (utils.cuh / fused.cu) so tcgen05_ld.h asm operands are not erased.
     if os.name == "nt":
-        CXX_FLAGS = ["/Zi", "/openmp", "/std:c++17", "/Zc:__cplusplus", "/DENABLE_BF16", "/MD", "/permissive-"]
+        CXX_FLAGS = ["/Zi", "/openmp", "/std:c++20", "/Zc:__cplusplus", "/Zc:preprocessor", "/DENABLE_BF16", "/MD", "/permissive-"]
         NVCC_FLAGS = [
             "-O3",
-            "-std=c++17",
+            "-std=c++20",
             "-U__CUDA_NO_HALF_OPERATORS__",
             "-U__CUDA_NO_HALF_CONVERSIONS__",
             "--use_fast_math",
@@ -65,10 +68,10 @@ if not SKIP_CUDA_BUILD:
         NVCC_FLAGS += [f"-Xcompiler={flag}" for flag in CXX_FLAGS]
         CXX_FLAGS += ["/O2"]
     else:
-        CXX_FLAGS = ["-g", "-O3", "-fopenmp", "-lgomp", "-std=c++17", "-DENABLE_BF16"]
+        CXX_FLAGS = ["-g", "-O3", "-fopenmp", "-lgomp", "-std=c++20", "-DENABLE_BF16"]
         NVCC_FLAGS = [
             "-O3",
-            "-std=c++17",
+            "-std=c++20",
             "-U__CUDA_NO_HALF_OPERATORS__",
             "-U__CUDA_NO_HALF_CONVERSIONS__",
             "--use_fast_math",
@@ -290,7 +293,7 @@ if not SKIP_CUDA_BUILD:
 
 setup(
     name='sageattention',
-    version='2.2.0',
+    version='2.2.0' + (f'+cu{torch.version.cuda.replace(".", "")}torch{torch.__version__.split("+")[0]}' if not SKIP_CUDA_BUILD else ''),
     author='SageAttention team',
     license='Apache 2.0 License',
     description='Accurate and efficient plug-and-play low-bit attention.',

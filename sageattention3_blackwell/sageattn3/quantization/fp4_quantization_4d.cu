@@ -16,6 +16,12 @@
 #include <torch/all.h>
 #include <torch/python.h>
 #include <torch/nn/functional.h>
+// MSVC SAL macros collide with CUDA 13.2 CCCL tcgen05 asm operands (__out).
+#if defined(_MSC_VER)
+#undef __in
+#undef __out
+#undef __inout
+#endif
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime_api.h>
