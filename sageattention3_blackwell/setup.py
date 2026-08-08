@@ -3,8 +3,8 @@ import os
 from pathlib import Path
 from packaging.version import parse, Version
 from setuptools import setup, find_packages
+from setuptools.command.bdist_wheel import bdist_wheel
 import subprocess
-from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 
 import torch
 from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension, CUDA_HOME
@@ -13,13 +13,27 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 
 PACKAGE_NAME = "sageattn3"
 
+
+def get_git_commit_timestamp():
+    try:
+        timestamp = subprocess.check_output(
+            ["git", "-C", this_dir, "log", "-1", "--format=%ct"]
+        ).strip().decode("utf-8")
+    except Exception:
+        return None
+    return timestamp if timestamp.isdigit() else None
+
+
+# Make wheel ZIP metadata deterministic
+# If SOURCE_DATE_EPOCH is unspecified, then query with git, then fallback to Unix epoch
+os.environ.setdefault("SOURCE_DATE_EPOCH", get_git_commit_timestamp() or "315532800")
+
 # FORCE_BUILD: Force a fresh build locally, instead of attempting to find prebuilt wheels
 # SKIP_CUDA_BUILD: Intended to allow CI to use a simple `python setup.py sdist` run to copy over raw files, without any cuda compilation
 FORCE_BUILD = os.getenv("FAHOPPER_FORCE_BUILD", "FALSE") == "TRUE"
 SKIP_CUDA_BUILD = os.getenv("FAHOPPER_SKIP_CUDA_BUILD", "FALSE") == "TRUE"
 # For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
 FORCE_CXX11_ABI = os.getenv("FAHOPPER_FORCE_CXX11_ABI", "FALSE") == "TRUE"
-
 
 
 def get_cuda_bare_metal_version(cuda_dir):
@@ -44,7 +58,20 @@ def check_if_cuda_home_none(global_option: str) -> None:
 
 
 def append_nvcc_threads(nvcc_extra_args):
-    return nvcc_extra_args + ["--threads", "4"]
+    return nvcc_extra_args + ["--threads", f"{os.cpu_count()}"]
+
+
+def add_windows_reproducible_path_flags(cxx_flags, nvcc_flags, path_mappings):
+    if os.name != "nt":
+        return
+
+    cxx_flags.append("/experimental:deterministic")
+    nvcc_flags.extend(["-Xcompiler", "/experimental:deterministic"])
+
+    for source, target in path_mappings:
+        source = os.path.normpath(os.path.realpath(source))
+        cxx_flags.append(f"/pathmap:{source}={target}")
+        nvcc_flags.extend(["-Xcompiler", f"/pathmap:{source}={target}"])
 
 
 cmdclass = {}
@@ -59,51 +86,45 @@ if not SKIP_CUDA_BUILD:
     _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
     if bare_metal_version < Version("12.8"):
         raise RuntimeError("Sage3 is only supported on CUDA 12.8 and above")
-    
+
     compute_capabilities = set()
-
-    # Prefer TORCH_CUDA_ARCH_LIST if explicitly specified (works without GPUs)
-    arch_list_env = os.getenv("TORCH_CUDA_ARCH_LIST", "").strip()
-    if arch_list_env:
-        for item in arch_list_env.replace(",", ";").split(";"):
-            it = item.strip()
-            if not it:
-                continue
-            it = it.lower().replace("sm_", "").replace("compute_", "")
-            it = it.replace("a", "")
-            if it.endswith("+ptx"):
-                it = it[:-4]
-                compute_capabilities.add(f"{it}+PTX")
-            else:
-                if len(it) == 2 and it.isdigit():
-                    it = f"{it[0]}.{it[1]}"
-                compute_capabilities.add(it)
-
-        for capability in compute_capabilities:
-            if capability.startswith("10.0"):
-                cc_flag.append("-gencode")
-                cc_flag.append("arch=compute_100a,code=sm_100a")
-            elif capability.startswith("12.0"):
-                cc_flag.append("-gencode")
-                cc_flag.append("arch=compute_120a,code=sm_120a")
-            elif capability.startswith("12.1"):
-                cc_flag.append("-gencode")
-                cc_flag.append("arch=compute_121a,code=sm_121a")
-            else:
-                raise RuntimeError(f"Unsupported GPU capability specified: {capability}")
-
-    # If no TORCH_CUDA_ARCH_LIST, try to detect the GPU capability (only works with GPUs)
+    if os.getenv("TORCH_CUDA_ARCH_LIST"):
+        # TORCH_CUDA_ARCH_LIST is separated by space or semicolon
+        for x in os.getenv("TORCH_CUDA_ARCH_LIST").replace(";", " ").split():
+            compute_capabilities.add(x)
     else:
-        cc_major, cc_minor = torch.cuda.get_device_capability()
-        if (cc_major, cc_minor) == (10, 0):  # sm_100
-            cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_100a,code=sm_100a")
-        elif (cc_major, cc_minor) == (12, 0):  # sm_120
-            cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_120a,code=sm_120a")
-        elif (cc_major, cc_minor) == (12, 1):  # sm_121
-            cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_121a,code=sm_121a")
+        # Iterate over all GPUs on the current machine.
+        device_count = torch.cuda.device_count()
+        for i in range(device_count):
+            major, minor = torch.cuda.get_device_capability(i)
+            if major < 7:
+                warnings.warn(f"skipping GPU {i} with compute capability {major}.{minor}")
+                continue
+            compute_capabilities.add(f"{major}.{minor}")
+
+    def capability_sort_key(capability):
+        base = capability.split("+")[0]
+        major, minor = base.split(".")
+        return (int(major), int(minor), capability)
+
+    # Sort compute_capabilities for reproducible build
+    compute_capabilities = sorted(compute_capabilities, key=capability_sort_key)
+
+    def has_capability(target):
+        return any(cc.startswith(target) for cc in compute_capabilities)
+
+    if not has_capability(("10.0", "12.0", "12.1")):
+        raise RuntimeError("Unsupported compute capability. You may set TORCH_CUDA_ARCH_LIST")
+
+    if has_capability("10.0"):
+        cc_flag.append("-gencode")
+        cc_flag.append("arch=compute_100a,code=sm_100a")
+    if has_capability("12.0"):
+        cc_flag.append("-gencode")
+        cc_flag.append("arch=compute_120a,code=sm_120a")
+    if has_capability("12.1"):
+        cc_flag.append("-gencode")
+        cc_flag.append("arch=compute_121a,code=sm_121a")
 
     # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
     # torch._C._GLIBCXX_USE_CXX11_ABI
@@ -111,16 +132,27 @@ if not SKIP_CUDA_BUILD:
     if FORCE_CXX11_ABI:
         torch._C._GLIBCXX_USE_CXX11_ABI = True
     repo_dir = Path(this_dir)
-    cutlass_dir = repo_dir / "csrc" / "cutlass"
-    (repo_dir / "csrc").mkdir(parents=True, exist_ok=True)
-    if not cutlass_dir.exists():
-        subprocess.run(
-            ["git", "clone", "--depth", "1", "https://github.com/NVIDIA/cutlass.git", str(cutlass_dir)],
-            check=True
-        )
+    cutlass_dir = repo_dir / "cutlass"
+
+    # Torch 2.13+ / CUDA 13.2: C++20 + MSVC /Zc:preprocessor
+    if os.name == "nt":
+        # TODO: Detect MSVC rather than OS
+        CXX_FLAGS = [
+            "/O2",
+            "/permissive-",
+            "/std:c++20",
+            "/Zc:__cplusplus",
+            "/Zc:preprocessor",
+            "/bigobj",
+            "/MD",
+        ]
+        LINK_FLAGS = ["/Brepro"]
+    else:
+        CXX_FLAGS = ["-O3", "-std=c++20"]
+        LINK_FLAGS = []
+
     nvcc_flags = [
         "-O3",
-        # "-O0",
         "-std=c++20",
         "-U__CUDA_NO_HALF_OPERATORS__",
         "-U__CUDA_NO_HALF_CONVERSIONS__",
@@ -131,42 +163,55 @@ if not SKIP_CUDA_BUILD:
         "--expt-relaxed-constexpr",
         "--expt-extended-lambda",
         "--use_fast_math",
-        # "--ptxas-options=-v",  # printing out number of registers
-        "--ptxas-options=--verbose,--warn-on-local-memory-usage",  # printing out number of registers
-        "-diag-suppress=177",
-        "-lineinfo",
+        # "--ptxas-options=--verbose,--warn-on-local-memory-usage",  # printing out number of registers
+        # "-lineinfo",  # Disabled for reproducible build
         "-DCUTLASS_DEBUG_TRACE_LEVEL=0",  # Can toggle for debugging
         "-DNDEBUG",  # Important, otherwise performance is severely impacted
         "-DQBLKSIZE=128",
         "-DKBLKSIZE=128",
         "-DCTA256",
         "-DDQINRMEM",
+        "-diag-suppress=68",
+        "-diag-suppress=177",
+        "-diag-suppress=221",
+        "-diag-suppress=550",
+        "-diag-suppress=3357",
     ]
+    if os.name == "nt":
+        # https://github.com/pytorch/pytorch/issues/148317
+        nvcc_flags += [
+            "-Xcompiler=/Zc:preprocessor",
+            "-Xcompiler=/std:c++20",
+            "-Xcompiler=/Zc:__cplusplus",
+            "-D_WIN32=1",
+            "-DUSE_CUDA=1",
+        ]
+
+    add_windows_reproducible_path_flags(
+        CXX_FLAGS,
+        nvcc_flags,
+        [
+            (this_dir, r"C:\reproducible\path\SageAttention\sageattention3_blackwell"),
+            (os.path.dirname(os.path.abspath(torch.__file__)), r"C:\reproducible\path\torch"),
+        ],
+    )
+
     include_dirs = [
-        repo_dir / "sageattn3",
         cutlass_dir / "include",
         cutlass_dir / "tools" / "util" / "include",
     ]
 
-    if os.name == "nt":
-        nvcc_flags += ["-D_WIN32=1", "-DUSE_CUDA=1"]
-        # Torch 2.13+ headers need C++20; /Zc:preprocessor already required for CUDA 13.2 CCCL.
-        cxx_flags = ["/std:c++20", "/Zc:__cplusplus", "/Zc:preprocessor", "/bigobj", "/MD", "/permissive-"]
-        nvcc_flags += [f"-Xcompiler={flag}" for flag in cxx_flags]
-        cxx_flags += ["/O2"]
-    else:
-        cxx_flags = ["-O3", "-std=c++20"]        
-
     ext_modules.append(
         CUDAExtension(
-            name="fp4attn_cuda",
-            sources=["sageattn3/blackwell/api.cu"],
+            name="sageattn3.fp4attn_cuda",
+            sources=["csrc/blackwell/api.cu"],
             extra_compile_args={
-                "cxx": cxx_flags,
+                "cxx": CXX_FLAGS,
                 "nvcc": append_nvcc_threads(
                     nvcc_flags + ["-DEXECMODE=0"] + cc_flag
                 ),
             },
+            extra_link_args=LINK_FLAGS,
             include_dirs=include_dirs,
             # Without this we get and error about cuTensorMapEncodeTiled not defined
             libraries=["cuda"]
@@ -174,14 +219,15 @@ if not SKIP_CUDA_BUILD:
     )
     ext_modules.append(
         CUDAExtension(
-            name="fp4quant_cuda",
-            sources=["sageattn3/quantization/fp4_quantization_4d.cu"],
+            name="sageattn3.fp4quant_cuda",
+            sources=["csrc/quantization/fp4_quantization_4d.cu"],
             extra_compile_args={
-                "cxx": cxx_flags,
+                "cxx": CXX_FLAGS,
                 "nvcc": append_nvcc_threads(
                     nvcc_flags + ["-DEXECMODE=0"] + cc_flag
                 ),
             },
+            extra_link_args=LINK_FLAGS,
             include_dirs=include_dirs,
             # Without this we get and error about cuTensorMapEncodeTiled not defined
             libraries=["cuda"]
@@ -189,14 +235,17 @@ if not SKIP_CUDA_BUILD:
     )
 
 
-
-class CachedWheelsCommand(_bdist_wheel):
+class CachedWheelsCommand(bdist_wheel):
     def run(self):
         super().run()
 
+
 setup(
     name=PACKAGE_NAME,
-    version="1.0.0" + (f"+cu{torch.version.cuda.replace('.', '')}torch{torch.__version__.split('+')[0]}" if not SKIP_CUDA_BUILD else ""),
+    version="1.0.0" + (
+        f"+cu{torch.version.cuda.replace('.', '')}torch{torch.__version__.split('+')[0]}"
+        if not SKIP_CUDA_BUILD else ""
+    ) + os.environ.get("SAGEATTENTION_WHEEL_VERSION_SUFFIX", ""),
     packages=find_packages(
         exclude=(
             "build",
@@ -217,14 +266,6 @@ setup(
     ext_modules=ext_modules,
     cmdclass={"bdist_wheel": CachedWheelsCommand, "build_ext": BuildExtension}
     if ext_modules
-    else {
-        "bdist_wheel": CachedWheelsCommand,
-    },
-    python_requires=">=3.8",
-    install_requires=[
-        "torch",
-        "einops",
-        "packaging",
-        "ninja",
-    ],
+    else {"bdist_wheel": CachedWheelsCommand},
+    python_requires=">=3.9",
 )

@@ -52,20 +52,11 @@ from .quant import per_channel_fp8
 from typing import Any, List, Literal, Optional, Tuple, Union
 import warnings
 
-import subprocess
-import re
-
 
 def get_cuda_version():
-    try:
-        output = subprocess.check_output(['nvcc', '--version']).decode()
-        match = re.search(r'release (\d+)\.(\d+)', output)
-        if match:
-            major, minor = int(match.group(1)), int(match.group(2))
-            return major, minor
-    except Exception as e:
-        print("Failed to get CUDA version:", e)
-    return None, None
+    version = torch.version.cuda
+    major, minor = version.split('.')
+    return int(major), int(minor)
 
 
 def get_cuda_arch_versions():
@@ -74,6 +65,29 @@ def get_cuda_arch_versions():
         major, minor = torch.cuda.get_device_capability(i)
         cuda_archs.append(f"sm{major}{minor}")
     return cuda_archs
+
+
+# Currently get_cuda_arch_versions cannot be traced by torch.compile
+_cuda_archs = get_cuda_arch_versions()
+
+
+def pad_qkv(q, k, v):
+    head_dim_og = q.size(-1)
+    if head_dim_og < 64:
+        q = F.pad(q, (0, 64 - head_dim_og))
+        k = F.pad(k, (0, 64 - head_dim_og))
+        v = F.pad(v, (0, 64 - head_dim_og))
+    elif head_dim_og > 64 and head_dim_og < 128:
+        q = F.pad(q, (0, 128 - head_dim_og))
+        k = F.pad(k, (0, 128 - head_dim_og))
+        v = F.pad(v, (0, 128 - head_dim_og))
+    elif head_dim_og > 128 and head_dim_og < 256:
+        q = F.pad(q, (0, 256 - head_dim_og))
+        k = F.pad(k, (0, 256 - head_dim_og))
+        v = F.pad(v, (0, 256 - head_dim_og))
+    elif head_dim_og > 256:
+        raise ValueError(f"Unsupported head_dim: {head_dim_og}")
+    return head_dim_og, q, k, v
 
 
 def sageattn(
@@ -140,19 +154,28 @@ def sageattn(
     - All tensors must be on the same cuda device.
     """
         
-    arch = get_cuda_arch_versions()[q.device.index]
-    if arch == "sm80":
-        return sageattn_qk_int8_pv_fp16_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32")
-    elif arch == "sm86":
+    arch = _cuda_archs[q.device.index]
+    if arch == "sm75":
         return sageattn_qk_int8_pv_fp16_triton(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse)
+    elif arch in {"sm80", "sm86", "sm87"}:
+        return sageattn_qk_int8_pv_fp16_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32")
     elif arch == "sm89":
-        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp16")
+        if get_cuda_version() < (12, 8):
+            pv_accum_dtype = "fp32+fp32"
+        else:
+            # SageAttention2++
+            pv_accum_dtype = "fp32+fp16"
+        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype=pv_accum_dtype)
     elif arch == "sm90":
         return sageattn_qk_int8_pv_fp8_cuda_sm90(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp32")
-    elif arch == "sm120":
-        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, qk_quant_gran="per_warp", sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp16") # sm120 has accurate fp32 accumulator for fp8 mma and triton kernel is currently not usable on sm120.
-    elif arch == "sm121":
-        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, qk_quant_gran="per_warp", sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp16") # sm121 has accurate fp32 accumulator for fp8 mma and triton kernel is currently not usable on sm121.
+    elif arch in {"sm100", "sm120", "sm121"}:
+        if get_cuda_version() < (12, 8):
+            # sm120 has accurate fp32 accumulator for fp8 mma and triton kernel is currently not usable on sm120.
+            pv_accum_dtype = "fp32"
+        else:
+            # SageAttention2++
+            pv_accum_dtype = "fp32+fp16"
+        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, qk_quant_gran="per_warp", sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype=pv_accum_dtype)
     else:
         raise ValueError(f"Unsupported CUDA architecture: {arch}")
 
@@ -249,26 +272,7 @@ def sageattn_qk_int8_pv_fp16_triton(
         assert attn_mask.dtype == torch.bool or attn_mask.dtype == q.dtype, "attn_mask must be of dtype bool or the same dtype as q."
         assert attn_mask.device == q.device, "All tensors must be on the same device."
 
-    # FIXME(DefTruth): make sage attention work compatible with distributed 
-    # env, for example, xDiT which launch by torchrun. Without this workaround, 
-    # sage attention will run into illegal memory access error after first 
-    # inference step in distributed env for multi gpus inference. This small
-    # workaround also make sage attention work compatible with torch.compile
-    # through non-fullgraph compile mode.
-    torch.cuda.set_device(v.device)
-
-    head_dim_og = q.size(-1)
-
-    if head_dim_og < 64:
-        q = torch.nn.functional.pad(q, (0, 64 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 64 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 64 - head_dim_og))
-    elif head_dim_og > 64 and head_dim_og < 128:
-        q = torch.nn.functional.pad(q, (0, 128 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 128 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 128 - head_dim_og))
-    elif head_dim_og > 128:
-        raise ValueError(f"Unsupported head_dim: {head_dim_og}")
+    head_dim_og, q, k, v = pad_qkv(q, k, v)
 
     # assert last dim is contiguous
     assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1, "Last dim of qkv must be contiguous."
@@ -402,26 +406,7 @@ def sageattn_varlen(
     assert q.device == k.device == v.device, "All tensors must be on the same device."
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
 
-    # FIXME(DefTruth): make sage attention work compatible with distributed 
-    # env, for example, xDiT which launch by torchrun. Without this workaround, 
-    # sage attention will run into illegal memory access error after first 
-    # inference step in distributed env for multi gpus inference. This small
-    # workaround also make sage attention work compatible with torch.compile
-    # through non-fullgraph compile mode.
-    torch.cuda.set_device(v.device)
-
-    head_dim_og = q.size(-1)
-
-    if head_dim_og < 64:
-        q = torch.nn.functional.pad(q, (0, 64 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 64 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 64 - head_dim_og))
-    elif head_dim_og > 64 and head_dim_og < 128:
-        q = torch.nn.functional.pad(q, (0, 128 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 128 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 128 - head_dim_og))
-    elif head_dim_og > 128:
-        raise ValueError(f"Unsupported head_dim: {head_dim_og}")
+    head_dim_og, q, k, v = pad_qkv(q, k, v)
 
     assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1, "Last dim of qkv must be contiguous."
     assert cu_seqlens_q.is_contiguous() and cu_seqlens_k.is_contiguous(), "cu_seqlens_q and cu_seqlens_k must be contiguous."
@@ -545,31 +530,12 @@ def sageattn_qk_int8_pv_fp16_cuda(
     assert q.device == k.device == v.device, "All tensors must be on the same device."
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
 
-    # FIXME(DefTruth): make sage attention work compatible with distributed 
-    # env, for example, xDiT which launch by torchrun. Without this workaround, 
-    # sage attention will run into illegal memory access error after first 
-    # inference step in distributed env for multi gpus inference. This small
-    # workaround also make sage attention work compatible with torch.compile
-    # through non-fullgraph compile mode.
-    torch.cuda.set_device(v.device)
-
     _tensor_layout = 0 if tensor_layout == "NHD" else 1
     _is_caual = 1 if is_causal else 0
     _qk_quant_gran = 3 if qk_quant_gran == "per_thread" else 2
     _return_lse = 1 if return_lse else 0
 
-    head_dim_og = q.size(-1)
-
-    if head_dim_og < 64:
-        q = torch.nn.functional.pad(q, (0, 64 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 64 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 64 - head_dim_og))
-    elif head_dim_og > 64 and head_dim_og < 128:
-        q = torch.nn.functional.pad(q, (0, 128 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 128 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 128 - head_dim_og))
-    elif head_dim_og > 128:
-        raise ValueError(f"Unsupported head_dim: {head_dim_og}")
+    head_dim_og, q, k, v = pad_qkv(q, k, v)
 
     # assert last dim is contiguous
     assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1, "Last dim of qkv must be contiguous."
@@ -598,10 +564,20 @@ def sageattn_qk_int8_pv_fp16_cuda(
     else:
         km = None
 
+    head_dim = q.size(-1)
+    blk_q, blk_k, warp_q, warp_k = 128, 64, 32, 64
+    if pv_accum_dtype in ["fp16", "fp32"] and head_dim == 256:
+        warp_q = 16
+    elif pv_accum_dtype == "fp16+fp32":
+        if head_dim == 128 and not is_causal:
+            blk_k, warp_q, warp_k = 32, 32, 32
+        elif head_dim > 64:
+            warp_q = 16
+
     if qk_quant_gran == "per_warp":
-        q_int8, q_scale, k_int8, k_scale = per_warp_int8_cuda(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=(16 if (q.size(-1) == 128 and pv_accum_dtype == "fp16+fp32") else 32), BLKK=64)
+        q_int8, q_scale, k_int8, k_scale = per_warp_int8_cuda(q, k, km, tensor_layout=tensor_layout, BLKQ=blk_q, WARPQ=warp_q, BLKK=blk_k)
     elif qk_quant_gran == "per_thread":
-        q_int8, q_scale, k_int8, k_scale = per_thread_int8_triton(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=(16 if (q.size(-1) == 128 and pv_accum_dtype == "fp16+fp32") else 32), BLKK=64, WARPK=64)
+        q_int8, q_scale, k_int8, k_scale = per_thread_int8_triton(q, k, km, tensor_layout=tensor_layout, BLKQ=blk_q, WARPQ=warp_q, BLKK=blk_k, WARPK=warp_k)
 
     o = torch.empty(q.size(), dtype=dtype, device=q.device)
 
@@ -729,36 +705,12 @@ def sageattn_qk_int8_pv_fp8_cuda(
     assert q.device == k.device == v.device, "All tensors must be on the same device."
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
 
-    # cuda_major_version, cuda_minor_version = get_cuda_version()
-    # if(cuda_major_version, cuda_minor_version) < (12, 8) and pv_accum_dtype == 'fp32+fp16':
-    #     warnings.warn("cuda version < 12.8, change pv_accum_dtype to 'fp32+fp32'")
-    #     pv_accum_dtype = 'fp32+fp32'
-
-    # FIXME(DefTruth): make sage attention work compatible with distributed 
-    # env, for example, xDiT which launch by torchrun. Without this workaround, 
-    # sage attention will run into illegal memory access error after first 
-    # inference step in distributed env for multi gpus inference. This small
-    # workaround also make sage attention work compatible with torch.compile
-    # through non-fullgraph compile mode.
-    torch.cuda.set_device(v.device)
-
     _tensor_layout = 0 if tensor_layout == "NHD" else 1
     _is_caual = 1 if is_causal else 0
     _qk_quant_gran = 3 if qk_quant_gran == "per_thread" else 2
     _return_lse = 1 if return_lse else 0
 
-    head_dim_og = q.size(-1)
-
-    if head_dim_og < 64:
-        q = torch.nn.functional.pad(q, (0, 64 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 64 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 64 - head_dim_og))
-    elif head_dim_og > 64 and head_dim_og < 128:
-        q = torch.nn.functional.pad(q, (0, 128 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 128 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 128 - head_dim_og))
-    elif head_dim_og > 128:
-        raise ValueError(f"Unsupported head_dim: {head_dim_og}")
+    head_dim_og, q, k, v = pad_qkv(q, k, v)
 
     # assert last dim is contiguous
     assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1, "Last dim of qkv must be contiguous."
@@ -787,10 +739,12 @@ def sageattn_qk_int8_pv_fp8_cuda(
     else:
         km = None
 
+    head_dim = q.size(-1)
+    warp_q = 16 if head_dim == 256 else 32
     if qk_quant_gran == "per_warp":
-        q_int8, q_scale, k_int8, k_scale = per_warp_int8_cuda(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=32, BLKK=64)
+        q_int8, q_scale, k_int8, k_scale = per_warp_int8_cuda(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=warp_q, BLKK=64)
     elif qk_quant_gran == "per_thread":
-        q_int8, q_scale, k_int8, k_scale = per_thread_int8_triton(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=32, BLKK=64, WARPK=64)
+        q_int8, q_scale, k_int8, k_scale = per_thread_int8_triton(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=warp_q, BLKK=64, WARPK=64)
 
     o = torch.empty(q.size(), dtype=dtype, device=q.device)
 
@@ -916,25 +870,12 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
     assert q.device == k.device == v.device, "All tensors must be on the same device."
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
 
-    torch.cuda.set_device(v.device)
-
     _tensor_layout = 0 if tensor_layout == "NHD" else 1
     _is_caual = 1 if is_causal else 0
     _qk_quant_gran = 3 if qk_quant_gran == "per_thread" else 2
     _return_lse = 1 if return_lse else 0
 
-    head_dim_og = q.size(-1)
-
-    if head_dim_og < 64:
-        q = torch.nn.functional.pad(q, (0, 64 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 64 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 64 - head_dim_og))
-    elif head_dim_og > 64 and head_dim_og < 128:
-        q = torch.nn.functional.pad(q, (0, 128 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 128 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 128 - head_dim_og))
-    elif head_dim_og > 128:
-        raise ValueError(f"Unsupported head_dim: {head_dim_og}")
+    head_dim_og, q, k, v = pad_qkv(q, k, v)
 
     # assert last dim is contiguous
     assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1, "Last dim of qkv must be contiguous."

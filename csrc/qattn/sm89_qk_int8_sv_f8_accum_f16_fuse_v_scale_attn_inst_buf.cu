@@ -123,7 +123,7 @@ torch::Tensor qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(torch::Tensor q
               
             constexpr int CTA_Q = 128;
             constexpr int CTA_K = 64;
-            constexpr int WARP_Q = 32;
+            constexpr int WARP_Q = (HEAD_DIM == 256) ? 16 : 32;
             constexpr int WARP_K = 64;
 
             assert(value.size(0) == batch_size);
@@ -158,8 +158,10 @@ torch::Tensor qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(torch::Tensor q
 
             dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
             dim3 block(32, (CTA_Q / WARP_Q) * (CTA_K / WARP_K));
+            const auto device_guard = make_device_guard(query);
+            const auto stream = get_current_cuda_stream(query);
 
-            kernel_func<<<grid, block, smem_max>>>(
+            kernel_func<<<grid, block, smem_max, stream>>>(
               query.data_ptr<int8_t>(), 
               key.data_ptr<int8_t>(),
               reinterpret_cast<int8_t*>(value.data_ptr()),

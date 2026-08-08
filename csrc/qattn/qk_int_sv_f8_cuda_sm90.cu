@@ -26,6 +26,21 @@
 
 #include "attn_utils.cuh"
 
+#define DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, ...)             \
+  if (head_dim == 64) {                                             \
+    constexpr int HEAD_DIM = 64;                                    \
+    __VA_ARGS__                                                     \
+  } else if (head_dim == 128) {                                     \
+    constexpr int HEAD_DIM = 128;                                   \
+    __VA_ARGS__                                                     \
+  } else {                                                          \
+    std::ostringstream err_msg;                                     \
+    err_msg << "SM90 kernel does not support head_dim="             \
+            << int(head_dim) << ". Only 64 and 128 are supported. " \
+            << "Use SM80 or SM89 kernels for head_dim=256.";        \
+    throw std::invalid_argument(err_msg.str());                     \
+  }
+
 template <int BlockMajorSize, int BlockMinorSize, bool swizzle=true, CUtensorMapL2promotion_enum promotion_mode=CU_TENSOR_MAP_L2_PROMOTION_NONE, typename T>
 CUtensorMap create_tensor_map_4D(T* gmem_ptr, int d1, int d2, int d3, int d4, int stride1, int stride2, int stride3) {
     constexpr int smem_stride = BlockMinorSize * sizeof(T);
@@ -686,7 +701,7 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(
 
   auto output_type = output.scalar_type();
 
-  DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+  DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
     DISPATCH_CAUSAL(is_causal, IS_CAUSAL, {
       DISPATCH_QK_QUANT_GRAN(qk_quant_gran, QK_QUANT_GRAN, {
         DISPATCH_RETURN_LSE(return_lse, RETURN_LSE, {
@@ -714,6 +729,8 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(
               static_assert(QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerWarp) || QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerThread), "Unsupported quantization granularity");
             }
 
+            const auto device_guard = make_device_guard(query);
+            const auto stream = get_current_cuda_stream(query);
             CUtensorMap tma_map_Q = create_tensor_map_4D<CTA_Q, HEAD_DIM>(reinterpret_cast<int8_t*>(query.data_ptr()), batch_size, num_qo_heads, qo_len, HEAD_DIM, stride_bz_q, stride_h_q, stride_seq_q);
             CUtensorMap tma_map_K = create_tensor_map_4D<CTA_K, HEAD_DIM>(reinterpret_cast<int8_t*>(key.data_ptr()), batch_size, num_kv_heads, kv_len, HEAD_DIM, stride_bz_k, stride_h_k, stride_seq_k);
             CUtensorMap tma_map_V = create_tensor_map_4D<HEAD_DIM, CTA_K>(reinterpret_cast<int8_t*>(value.data_ptr()), batch_size, num_kv_heads, HEAD_DIM, value.size(3), stride_bz_v, stride_h_v, stride_d_v);
@@ -737,7 +754,7 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(
                 cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize);
             
             dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
-            kernel<<<grid, NUM_THREADS, sMemSize>>>(
+            kernel<<<grid, NUM_THREADS, sMemSize, stream>>>(
               d_pack,
               reinterpret_cast<float*>(query_scale.data_ptr()),
               reinterpret_cast<float*>(key_scale.data_ptr()),
@@ -874,7 +891,7 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
 
   auto output_dtype = output.scalar_type();
 
-  DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+  DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
     DISPATCH_CAUSAL(is_causal, IS_CAUSAL, {
       DISPATCH_QK_QUANT_GRAN(qk_quant_gran, QK_QUANT_GRAN, {
         DISPATCH_RETURN_LSE(return_lse, RETURN_LSE, {
@@ -904,6 +921,8 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
 
             CHECK_SHAPE(value_scale, batch_size, num_kv_heads, head_dim);
 
+            const auto device_guard = make_device_guard(query);
+            const auto stream = get_current_cuda_stream(query);
             CUtensorMap tma_map_Q = create_tensor_map_4D<CTA_Q, HEAD_DIM>(reinterpret_cast<int8_t*>(query.data_ptr()), batch_size, num_qo_heads, qo_len, HEAD_DIM, stride_bz_q, stride_h_q, stride_seq_q);
             CUtensorMap tma_map_K = create_tensor_map_4D<CTA_K, HEAD_DIM>(reinterpret_cast<int8_t*>(key.data_ptr()), batch_size, num_kv_heads, kv_len, HEAD_DIM, stride_bz_k, stride_h_k, stride_seq_k);
             CUtensorMap tma_map_V = create_tensor_map_4D<HEAD_DIM, CTA_K>(reinterpret_cast<int8_t*>(value.data_ptr()), batch_size, num_kv_heads, HEAD_DIM, value.size(3), stride_bz_v, stride_h_v, stride_d_v);
@@ -927,7 +946,7 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
                 cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize);
             
             dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
-            kernel<<<grid, NUM_THREADS, sMemSize>>>(
+            kernel<<<grid, NUM_THREADS, sMemSize, stream>>>(
               d_pack,
               reinterpret_cast<float*>(query_scale.data_ptr()),
               reinterpret_cast<float*>(key_scale.data_ptr()),

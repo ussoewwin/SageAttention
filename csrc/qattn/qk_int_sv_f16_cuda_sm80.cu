@@ -61,7 +61,7 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
   static_assert(std::is_same<DTypeOut, half>::value || std::is_same<DTypeOut, nv_bfloat16>::value, "DTypeOut must be half or nv_bfloat16");
   static_assert(head_dim % 64 == 0, "head_dim must be a multiple of 64");
   static_assert(!fuse_v_mean || std::is_same<DTypeSVAccum, half>::value, "fuse_v_mean only supports half");
-  static_assert(CTA_Q / CTA_K <= 2); // for efficient causal implementation
+  static_assert(mask_mode != MaskMode::kCausal || CTA_Q / CTA_K <= 2); // for efficient causal implementation
 
   using DTypeOut2 = typename std::conditional<std::is_same<DTypeOut, half>::value, half2, nv_bfloat162>::type;
 
@@ -788,7 +788,7 @@ torch::Tensor qk_int8_sv_f16_accum_f32_attn(torch::Tensor query,
           DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(output_dtype, DTypeOut, {
             constexpr int CTA_Q = 128;
             constexpr int CTA_K = 64;
-            constexpr int WARP_Q = 32;
+            constexpr int WARP_Q = (HEAD_DIM == 256) ? 16 : 32;
             constexpr int WARP_K = 64;
 
             constexpr MaskMode mask_mode = IS_CAUSAL ? MaskMode::kCausal : MaskMode::kNone;
@@ -818,8 +818,10 @@ torch::Tensor qk_int8_sv_f16_accum_f32_attn(torch::Tensor query,
 
             dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
             dim3 block(32, (CTA_Q / WARP_Q) * (CTA_K / WARP_K));
+            const auto device_guard = make_device_guard(query);
+            const auto stream = get_current_cuda_stream(query);
 
-            kernel_func<<<grid, block, smem_max>>>(
+            kernel_func<<<grid, block, smem_max, stream>>>(
               query.data_ptr<int8_t>(), 
               key.data_ptr<int8_t>(),
               reinterpret_cast<half*>(value.data_ptr()),
@@ -963,7 +965,7 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn(torch::Tensor query,
               
             constexpr int CTA_Q = 128;
             constexpr int CTA_K = 64;
-            constexpr int WARP_Q = 32;
+            constexpr int WARP_Q = (HEAD_DIM == 256) ? 16 : 32;
             constexpr int WARP_K = 64;
 
             constexpr MaskMode mask_mode = IS_CAUSAL ? MaskMode::kCausal : MaskMode::kNone;
@@ -993,8 +995,10 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn(torch::Tensor query,
 
             dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
             dim3 block(32, (CTA_Q / WARP_Q) * (CTA_K / WARP_K));
+            const auto device_guard = make_device_guard(query);
+            const auto stream = get_current_cuda_stream(query);
 
-            kernel_func<<<grid, block, smem_max>>>(
+            kernel_func<<<grid, block, smem_max, stream>>>(
               query.data_ptr<int8_t>(), 
               key.data_ptr<int8_t>(),
               reinterpret_cast<half*>(value.data_ptr()),
@@ -1137,9 +1141,10 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn_inst_buf(torch::Tensor query,
           DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(output_dtype, DTypeOut, {
               
             constexpr int CTA_Q = 128;
-            constexpr int CTA_K = 64;
-            constexpr int WARP_Q = (HEAD_DIM == 64) ? 32 : 16;
-            constexpr int WARP_K = 64;
+            constexpr bool USE_NON_CAUSAL_HD128_TILE = !IS_CAUSAL && HEAD_DIM == 128;
+            constexpr int CTA_K = USE_NON_CAUSAL_HD128_TILE ? 32 : 64;
+            constexpr int WARP_Q = (HEAD_DIM == 64 || USE_NON_CAUSAL_HD128_TILE) ? 32 : 16;
+            constexpr int WARP_K = USE_NON_CAUSAL_HD128_TILE ? 32 : 64;
 
             constexpr MaskMode mask_mode = IS_CAUSAL ? MaskMode::kCausal : MaskMode::kNone;
 
@@ -1168,8 +1173,10 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn_inst_buf(torch::Tensor query,
 
             dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
             dim3 block(32, (CTA_Q / WARP_Q) * (CTA_K / WARP_K));
+            const auto device_guard = make_device_guard(query);
+            const auto stream = get_current_cuda_stream(query);
 
-            kernel_func<<<grid, block, smem_max>>>(
+            kernel_func<<<grid, block, smem_max, stream>>>(
               query.data_ptr<int8_t>(), 
               key.data_ptr<int8_t>(),
               reinterpret_cast<half*>(value.data_ptr()),
@@ -1320,7 +1327,7 @@ torch::Tensor qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(torch::Tensor query,
               
             constexpr int CTA_Q = 128;
             constexpr int CTA_K = 64;
-            constexpr int WARP_Q = 32;
+            constexpr int WARP_Q = (HEAD_DIM == 256) ? 16 : 32;
             constexpr int WARP_K = 64;
 
             constexpr MaskMode mask_mode = IS_CAUSAL ? MaskMode::kCausal : MaskMode::kNone;
@@ -1352,8 +1359,10 @@ torch::Tensor qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(torch::Tensor query,
 
             dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
             dim3 block(32, (CTA_Q / WARP_Q) * (CTA_K / WARP_K));
+            const auto device_guard = make_device_guard(query);
+            const auto stream = get_current_cuda_stream(query);
 
-            kernel_func<<<grid, block, smem_max>>>(
+            kernel_func<<<grid, block, smem_max, stream>>>(
               query.data_ptr<int8_t>(), 
               key.data_ptr<int8_t>(),
               reinterpret_cast<half*>(value.data_ptr()),
