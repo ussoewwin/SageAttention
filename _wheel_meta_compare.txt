@@ -1,0 +1,14 @@
+=== cp312 ===
+       15109  sageattention-2.2.0+cu132torch2.12.0.dist-info/METADATA
+         102  sageattention-2.2.0+cu132torch2.12.0.dist-info/WHEEL
+     2199552  sageattention/_fused.cp312-win_amd64.pyd
+    50195968  sageattention/_qattn_sm80.cp312-win_amd64.pyd
+    98609664  sageattention/_qattn_sm89.cp312-win_amd64.pyd
+     2477056  sageattention/_qattn_sm90.cp312-win_amd64.pyd
+=== cp313 ===
+       15109  sageattention-2.2.0+cu132torch2.12.0.dist-info/METADATA
+         101  sageattention-2.2.0+cu132torch2.12.0.dist-info/WHEEL
+     2426880  sageattention/_fused.cp313-win_amd64.pyd
+    57280512  sageattention/_qattn_sm80.cp313-win_amd64.pyd
+   110195712  sageattention/_qattn_sm89.cp313-win_amd64.pyd
+     2477056  sageattention/_qattn_sm90.cp313-win_amd64.pyd

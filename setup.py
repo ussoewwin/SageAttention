@@ -76,6 +76,7 @@ if not SKIP_CUDA_BUILD:
             "/Zc:preprocessor",
             "/DENABLE_BF16",
             "/MD",
+            "/D_USE_MATH_DEFINES",
         ]
         LINK_FLAGS = ["/Brepro"]
     else:
@@ -93,6 +94,7 @@ if not SKIP_CUDA_BUILD:
         "-diag-suppress=174",
         "-diag-suppress=177",
         "-diag-suppress=221",
+        "-D_USE_MATH_DEFINES",
     ]
     if os.name == "nt":
         # https://github.com/pytorch/pytorch/issues/148317
@@ -323,7 +325,7 @@ if not SKIP_CUDA_BUILD:
 
 setup(
     name='sageattention',
-    version='2.2.0' + (
+    version='2.2.0.post6' + (
         f'+cu{torch.version.cuda.replace(".", "")}torch{torch.__version__.split("+")[0]}'
         if not SKIP_CUDA_BUILD else ''
     ) + os.environ.get("SAGEATTENTION_WHEEL_VERSION_SUFFIX", ""),

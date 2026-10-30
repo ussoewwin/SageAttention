@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Copyright (c) 2025 by SageAttention team.
  * 
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,7 +16,6 @@
 
 // Include these 2 headers instead of torch/extension.h since we don't need all of the torch headers.
 #include <torch/python.h>
-#include <torch/nn/functional.h>
 // MSVC SAL macros collide with CUDA 13.2 CCCL tcgen05 asm operands (__out).
 #if defined(_MSC_VER)
 #undef __in
@@ -33,7 +32,7 @@
 #include "static_switch.h"
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
-#define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
+#define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes().equals(torch::IntArrayRef({__VA_ARGS__})), #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
 
@@ -345,3 +344,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashAttention";
     m.def("fwd", &mha_fwd, "Forward pass");
 }
+

@@ -1,4 +1,4 @@
-import warnings
+﻿import warnings
 import os
 from pathlib import Path
 from packaging.version import parse, Version
@@ -134,7 +134,7 @@ if not SKIP_CUDA_BUILD:
     repo_dir = Path(this_dir)
     cutlass_dir = repo_dir / "cutlass"
 
-    # Torch 2.13+ / CUDA 13.2: C++20 + MSVC /Zc:preprocessor
+    # Torch 2.13+ / CUDA 13.2+: C++20 + MSVC /Zc:preprocessor
     if os.name == "nt":
         # TODO: Detect MSVC rather than OS
         CXX_FLAGS = [
@@ -145,6 +145,7 @@ if not SKIP_CUDA_BUILD:
             "/Zc:preprocessor",
             "/bigobj",
             "/MD",
+            "/D_USE_MATH_DEFINES",
         ]
         LINK_FLAGS = ["/Brepro"]
     else:
@@ -164,7 +165,7 @@ if not SKIP_CUDA_BUILD:
         "--expt-extended-lambda",
         "--use_fast_math",
         # "--ptxas-options=--verbose,--warn-on-local-memory-usage",  # printing out number of registers
-        # "-lineinfo",  # Disabled for reproducible build
+        "-lineinfo",  # Required: GPU kernel source line info for profiling/debug
         "-DCUTLASS_DEBUG_TRACE_LEVEL=0",  # Can toggle for debugging
         "-DNDEBUG",  # Important, otherwise performance is severely impacted
         "-DQBLKSIZE=128",
@@ -176,6 +177,7 @@ if not SKIP_CUDA_BUILD:
         "-diag-suppress=221",
         "-diag-suppress=550",
         "-diag-suppress=3357",
+        "-D_USE_MATH_DEFINES",
     ]
     if os.name == "nt":
         # https://github.com/pytorch/pytorch/issues/148317
@@ -269,3 +271,4 @@ setup(
     else {"bdist_wheel": CachedWheelsCommand},
     python_requires=">=3.9",
 )
+

@@ -18,6 +18,12 @@
 
 #include <ATen/cuda/CUDAContext.h>
 
+#if defined(_MSC_VER)
+#undef __in
+#undef __out
+#undef __inout
+#endif
+
 #include "cute/tensor.hpp"
 
 #include "cutlass/cluster_launch.hpp"
