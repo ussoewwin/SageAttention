@@ -1,10 +1,33 @@
-﻿import warnings
+﻿import sys
+import warnings
 import os
 from pathlib import Path
 from packaging.version import parse, Version
 from setuptools import setup, find_packages
 from setuptools.command.bdist_wheel import bdist_wheel
 import subprocess
+
+def _ensure_ninja_on_path():
+    """Make the bundled ninja discoverable so torch uses its ninja backend.
+
+    torch selects the ninja backend only when ``ninja --version`` resolves on
+    PATH. That backend is the one that forwards ``extra_compile_args["cxx"]``
+    to cl.exe; the distutils backend drops the dict, so with setuptools >= 82
+    the C++20 flags (/std:c++20, /Zc:preprocessor, ...) never reach cl.exe and
+    the PyTorch headers abort with C1189.
+    """
+    candidates = [
+        os.path.join(os.path.dirname(sys.executable), "Scripts"),
+        os.path.join(sys.prefix, "Scripts"),
+    ]
+    for scripts_dir in candidates:
+        if os.path.isfile(os.path.join(scripts_dir, "ninja.exe")):
+            os.environ["PATH"] = scripts_dir + os.pathsep + os.environ.get("PATH", "")
+            return scripts_dir
+    return None
+
+
+_ensure_ninja_on_path()
 
 import torch
 from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension, CUDA_HOME
