@@ -174,9 +174,3 @@ cython_debug/
 .pypirc
 
 /wheelhouse
-
-# local-only: vendored CUTLASS copy (use the sageattention3_blackwell/cutlass submodule instead)
-sageattention3_blackwell/csrc/cutlass/
-
-# local-only: comparison wheel build output
-sageattention3_blackwell/dist_compare/
